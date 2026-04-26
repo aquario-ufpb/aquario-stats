@@ -24,6 +24,11 @@ class GitHubContributorsFetcher {
     this.repo = repo;
     this.token = token;
     this.baseUrl = "https://github.com";
+    this.maxStatsWaitMs = Number(
+      process.env.GITHUB_STATS_MAX_WAIT_MS || 30 * 60 * 1000
+    );
+    this.initialStatsRetryDelayMs = 5000;
+    this.maxStatsRetryDelayMs = 60000;
   }
 
   /**
@@ -51,18 +56,6 @@ class GitHubContributorsFetcher {
       options.headers["Authorization"] = `Bearer ${this.token}`;
     }
 
-    // Try web endpoint first
-    try {
-      const webData = await this.makeRequest(webUrl, options);
-      if (webData && Array.isArray(webData) && webData.length > 0) {
-        return webData;
-      }
-    } catch (error) {
-      console.log(`⚠️  Web endpoint failed: ${error.message}, trying API endpoint...`);
-    }
-
-    // Fallback to GitHub API
-    console.log("📡 Using GitHub REST API endpoint...");
     const apiOptions = {
       hostname: apiUrl,
       path: apiPath,
@@ -77,12 +70,96 @@ class GitHubContributorsFetcher {
       apiOptions.headers["Authorization"] = `Bearer ${this.token}`;
     }
 
-    try {
-      const apiData = await this.makeApiRequest(apiOptions);
-      return apiData;
-    } catch (error) {
-      throw new Error(`Both endpoints failed. API error: ${error.message}`);
+    const startedAt = Date.now();
+    let retryDelayMs = this.initialStatsRetryDelayMs;
+    let attempt = 1;
+    let lastError = null;
+
+    while (Date.now() - startedAt < this.maxStatsWaitMs) {
+      console.log(`🔎 Fetch attempt ${attempt}...`);
+
+      try {
+        const webData = await this.makeRequest(webUrl, options);
+        if (webData && Array.isArray(webData) && webData.length > 0) {
+          return webData;
+        }
+      } catch (error) {
+        lastError = error;
+        if (error.statusCode === 202) {
+          console.log("⏳ GitHub web stats are still computing.");
+        } else {
+          console.log(`⚠️  Web endpoint failed: ${error.message}`);
+        }
+      }
+
+      console.log("📡 Trying GitHub REST API endpoint...");
+      try {
+        const apiData = await this.makeApiRequest(apiOptions);
+        return apiData;
+      } catch (error) {
+        lastError = error;
+        if (error.statusCode === 202) {
+          console.log("⏳ GitHub API stats are still computing.");
+        } else if (!this.token && this.isRateLimitError(error)) {
+          console.log("⚠️  Unauthenticated GitHub API rate limit hit.");
+        } else {
+          throw new Error(`Both endpoints failed. API error: ${error.message}`);
+        }
+      }
+
+      const elapsedMs = Date.now() - startedAt;
+      const remainingMs = this.maxStatsWaitMs - elapsedMs;
+      const sleepMs = Math.min(retryDelayMs, remainingMs);
+
+      if (sleepMs <= 0) {
+        break;
+      }
+
+      console.log(
+        `↻ Waiting ${this.formatDuration(sleepMs)} before retrying ` +
+          `(${this.formatDuration(elapsedMs)} elapsed, ` +
+          `${this.formatDuration(Math.max(remainingMs, 0))} remaining)...`
+      );
+      await this.sleep(sleepMs);
+
+      retryDelayMs = Math.min(
+        Math.round(retryDelayMs * 1.6),
+        this.maxStatsRetryDelayMs
+      );
+      attempt += 1;
     }
+
+    throw new Error(
+      `GitHub contributor stats were still computing after ${this.formatDuration(this.maxStatsWaitMs)}. ` +
+        `Last response: ${lastError ? lastError.message : "no response"}`
+    );
+  }
+
+  sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  formatDuration(ms) {
+    if (ms < 1000) {
+      return `${ms}ms`;
+    }
+
+    const totalSeconds = Math.ceil(ms / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+
+    if (minutes === 0) {
+      return `${seconds}s`;
+    }
+
+    return seconds === 0 ? `${minutes}m` : `${minutes}m ${seconds}s`;
+  }
+
+  isRateLimitError(error) {
+    return (
+      error.statusCode === 403 &&
+      /rate limit exceeded/i.test(error.responseBody || error.message)
+    );
   }
 
   /**
@@ -105,7 +182,9 @@ class GitHubContributorsFetcher {
         res.on("end", () => {
           // Check if response is empty
           if (!data || data.trim().length === 0) {
-            reject(new Error(`Empty response from server (Status: ${res.statusCode})`));
+            const error = new Error(`Empty response from server (Status: ${res.statusCode})`);
+            error.statusCode = res.statusCode;
+            reject(error);
             return;
           }
 
@@ -152,9 +231,9 @@ class GitHubContributorsFetcher {
         if (res.statusCode === 202) {
           // API is computing stats, need to wait and retry
           console.log("⏳ GitHub API is computing stats, this may take a moment...");
-          setTimeout(() => {
-            this.makeApiRequest(options).then(resolve).catch(reject);
-          }, 2000);
+          const error = new Error("GitHub API is computing stats");
+          error.statusCode = res.statusCode;
+          reject(error);
           return;
         }
 
@@ -164,7 +243,12 @@ class GitHubContributorsFetcher {
             errorData += chunk;
           });
           res.on("end", () => {
-            reject(new Error(`API request failed with status ${res.statusCode}: ${errorData}`));
+            const error = new Error(
+              `API request failed with status ${res.statusCode}: ${errorData}`
+            );
+            error.statusCode = res.statusCode;
+            error.responseBody = errorData;
+            reject(error);
           });
           return;
         }
@@ -390,7 +474,9 @@ if (require.main === module) {
   const repo = args[1];
   const tokenIndex = args.indexOf("--token");
   const token =
-    tokenIndex !== -1 && args[tokenIndex + 1] ? args[tokenIndex + 1] : null;
+    tokenIndex !== -1 && args[tokenIndex + 1]
+      ? args[tokenIndex + 1]
+      : process.env.GITHUB_TOKEN || process.env.GH_TOKEN || null;
 
   const fetcher = new GitHubContributorsFetcher(owner, repo, token);
 

@@ -8,8 +8,9 @@ on:
   push:
     branches: [main]
     paths:
+      - "scripts/fetch-contributors.js"
       - "scripts/generate-insights.js"
-      - ".github/workflows/contributor-insights.yml"
+      - ".github/workflows/contributor-stats.yml"
 
 jobs:
   generate-insights:
@@ -40,6 +41,8 @@ jobs:
           pip install -r requirements.txt
 
       - name: Fetch contributor data
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           node scripts/fetch-contributors.js aquario-ufpb aquario
 
